@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+:root {
+  font-family: "Quicksand", "Noto Sans KR", system-ui, sans-serif;
+  color: #444;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #f4fbf4;
+}
