@@ -367,13 +367,12 @@ function App() {
     const initial = { later: [], focus: [], done: [] };
     tasks.forEach((task) => {
       if (!initial[task.status]) return;
-      if (task.status === "done") return;
       initial[task.status].push(task);
     });
     return {
       later: sortedByPinAndRecent(initial.later),
       focus: sortedByPinAndRecent(initial.focus),
-      done: [],
+      done: sortedByPinAndRecent(initial.done),
     };
   }, [tasks]);
 
