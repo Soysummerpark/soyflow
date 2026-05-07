@@ -128,25 +128,57 @@ function addDaysToDateKey(dateKey, deltaDays) {
   return getLocalDateString(dt);
 }
 
-function rollOverTasks(tasksByDate) {
-  const today = getLocalDateString();
-  const past = Object.keys(tasksByDate).filter((k) => k < today).sort();
-  if (past.length === 0) return tasksByDate;
+function normalizeSubtask(sub) {
+  return {
+    id: sub?.id ?? uid(),
+    text: typeof sub?.text === "string" ? sub.text : "",
+    done: Boolean(sub?.done),
+    minutes: Number.isFinite(Number(sub?.minutes)) ? Math.max(0, Math.floor(Number(sub.minutes))) : 0,
+  };
+}
 
+function normalizeTask(task) {
+  return {
+    ...task,
+    minutes: Number.isFinite(Number(task?.minutes)) ? Math.max(0, Math.floor(Number(task.minutes))) : 0,
+    subtasks: Array.isArray(task?.subtasks) ? task.subtasks.map(normalizeSubtask) : [],
+  };
+}
+
+function normalizeTasksByDate(tasksByDate) {
+  const next = {};
+  Object.entries(tasksByDate ?? {}).forEach(([dateKey, list]) => {
+    if (!Array.isArray(list)) return;
+    next[dateKey] = list.map(normalizeTask);
+  });
+  return next;
+}
+
+function carryForwardIncompleteTasks(tasksByDate, todayDateKey) {
   const next = { ...tasksByDate };
-  const movedToToday = [];
+  const todayList = next[todayDateKey] ?? [];
+  const existingIds = new Set(todayList.map((t) => t.id));
+  const toCopy = [];
 
-  for (const d of past) {
-    const list = next[d] ?? [];
-    const move = list.filter((t) => t.status === "later" || t.status === "focus");
-    const stay = list.filter((t) => t.status === "done");
-    movedToToday.push(...move);
-    if (stay.length) next[d] = stay;
-    else delete next[d];
-  }
+  Object.entries(next).forEach(([dateKey, list]) => {
+    if (dateKey >= todayDateKey || !Array.isArray(list)) return;
+    list.forEach((task) => {
+      if (task.status === "done") return;
+      if (existingIds.has(task.id)) return;
+      existingIds.add(task.id);
+      toCopy.push({
+        ...task,
+        subtasks: Array.isArray(task.subtasks)
+          ? task.subtasks.map((sub) => ({ ...sub }))
+          : [],
+      });
+    });
+  });
 
-  if (movedToToday.length > 0) {
-    next[today] = [...movedToToday, ...(next[today] ?? [])];
+  if (toCopy.length > 0) {
+    next[todayDateKey] = [...toCopy, ...todayList];
+  } else if (!next[todayDateKey]) {
+    next[todayDateKey] = todayList;
   }
 
   return next;
@@ -157,13 +189,27 @@ function loadSettingsByDate() {
     const rawV2 = localStorage.getItem(SETTINGS_KEY_V2);
     if (rawV2) {
       const parsed = JSON.parse(rawV2);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const normalized = {};
+        Object.entries(parsed).forEach(([dateKey, value]) => {
+          if (!value || typeof value !== "object") return;
+          if (value.focusMinutes != null) {
+            normalized[dateKey] = { focusMinutes: Number(value.focusMinutes) || 0 };
+            return;
+          }
+          // Backward compatibility: old data stored focusHours.
+          if (value.focusHours != null) {
+            normalized[dateKey] = { focusMinutes: Math.floor((Number(value.focusHours) || 0) * 60) };
+          }
+        });
+        return normalized;
+      }
     }
     const rawV1 = localStorage.getItem(SETTINGS_KEY_V1);
     if (rawV1) {
       const parsed = JSON.parse(rawV1);
       if (parsed?.date && parsed.focusHours != null) {
-        return { [parsed.date]: { focusHours: Number(parsed.focusHours) } };
+        return { [parsed.date]: { focusMinutes: Math.floor((Number(parsed.focusHours) || 0) * 60) } };
       }
     }
   } catch {
@@ -173,26 +219,29 @@ function loadSettingsByDate() {
 }
 
 function loadTasksByDate() {
+  const today = getLocalDateString();
+
   try {
     const rawV2 = localStorage.getItem(STORAGE_KEY_V2);
     if (rawV2) {
       const parsed = JSON.parse(rawV2);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return rollOverTasks(parsed);
+        const normalized = normalizeTasksByDate(parsed);
+        return carryForwardIncompleteTasks(normalized, today);
       }
     }
     const rawV1 = localStorage.getItem(STORAGE_KEY_V1);
     if (rawV1) {
       const parsed = JSON.parse(rawV1);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        const today = getLocalDateString();
-        return rollOverTasks({ [today]: parsed });
+        const normalized = normalizeTasksByDate({ [today]: parsed });
+        return carryForwardIncompleteTasks(normalized, today);
       }
     }
   } catch {
     /* ignore */
   }
-  return rollOverTasks({});
+  return carryForwardIncompleteTasks({}, today);
 }
 
 function formatDateLabel(dateKey) {
@@ -215,18 +264,21 @@ function App() {
 
   const [showDailyModal, setShowDailyModal] = useState(() => {
     const s = loadSettingsByDate();
-    return !s[getLocalDateString()]?.focusHours;
+    return !s[getLocalDateString()]?.focusMinutes;
   });
-  const [focusHoursInput, setFocusHoursInput] = useState(() => {
+  const [focusMinutesInput, setFocusMinutesInput] = useState(() => {
     const s = loadSettingsByDate();
-    return String(s[getLocalDateString()]?.focusHours ?? "4");
+    return String(s[getLocalDateString()]?.focusMinutes ?? "240");
   });
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskSize, setNewTaskSize] = useState("medium");
+  const [newTaskMinutes, setNewTaskMinutes] = useState("0");
   const [editingTaskId, setEditingTaskId] = useState(null);
   const [subtaskInput, setSubtaskInput] = useState("");
+  const [newSubtaskMinutes, setNewSubtaskMinutes] = useState("0");
   const [editingSubtaskId, setEditingSubtaskId] = useState(null);
   const [subtaskEditValue, setSubtaskEditValue] = useState("");
+  const [subtaskEditMinutes, setSubtaskEditMinutes] = useState("0");
   const [menuTaskId, setMenuTaskId] = useState(null);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(() => getLocalDateString().slice(0, 7));
@@ -241,8 +293,9 @@ function App() {
 
   useEffect(() => {
     const tick = () => {
-      setTodayKey(getLocalDateString());
-      setTasksByDate((prev) => rollOverTasks(prev));
+      const latestToday = getLocalDateString();
+      setTodayKey(latestToday);
+      setTasksByDate((prev) => carryForwardIncompleteTasks(prev, latestToday));
     };
     tick();
     const id = setInterval(tick, 60_000);
@@ -259,6 +312,8 @@ function App() {
   useEffect(() => {
     setEditingSubtaskId(null);
     setSubtaskEditValue("");
+    setSubtaskEditMinutes("0");
+    setNewSubtaskMinutes("0");
   }, [editingTaskId]);
 
   const tasks = tasksByDate[selectedDate] ?? [];
@@ -271,17 +326,26 @@ function App() {
     });
   };
 
-  const focusCapacity = Number(settingsByDate[selectedDate]?.focusHours) || 0;
+  const parseMinutes = (value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) return 0;
+    return Math.floor(parsed);
+  };
 
-  const focusHoursUsed = useMemo(
+  const getTaskTotalMinutes = (task) =>
+    (task.minutes ?? 0) + (task.subtasks ?? []).reduce((sum, sub) => sum + (sub.minutes ?? 0), 0);
+
+  const focusCapacityMinutes = Number(settingsByDate[selectedDate]?.focusMinutes) || 0;
+
+  const focusMinutesUsed = useMemo(
     () =>
       tasks
         .filter((task) => task.status === "focus")
-        .reduce((sum, task) => sum + (SIZE_META[task.size]?.hours ?? 0), 0),
+        .reduce((sum, task) => sum + getTaskTotalMinutes(task), 0),
     [tasks]
   );
 
-  const isOverflow = focusCapacity > 0 && focusHoursUsed > focusCapacity;
+  const isOverflow = focusCapacityMinutes > 0 && focusMinutesUsed > focusCapacityMinutes;
 
   const sortedByPinAndRecent = (list) =>
     [...list].sort((a, b) => {
@@ -305,7 +369,7 @@ function App() {
   const editingTask = tasks.find((t) => t.id === editingTaskId) ?? null;
 
   const openDailyModal = () => {
-    setFocusHoursInput(String(settingsByDate[selectedDate]?.focusHours ?? "4"));
+    setFocusMinutesInput(String(settingsByDate[selectedDate]?.focusMinutes ?? "240"));
     setShowDailyModal(true);
   };
 
@@ -317,6 +381,7 @@ function App() {
       id: uid(),
       title,
       size: newTaskSize,
+      minutes: parseMinutes(newTaskMinutes),
       status: "later",
       pinned: false,
       subtasks: [],
@@ -325,6 +390,7 @@ function App() {
     setTaskList((prev) => [task, ...prev]);
     setNewTaskTitle("");
     setNewTaskSize("medium");
+    setNewTaskMinutes("0");
   };
 
   const updateTask = (taskId, updater) => {
@@ -351,9 +417,13 @@ function App() {
     if (!editingTask || !text) return;
     updateTask(editingTask.id, (task) => ({
       ...task,
-      subtasks: [...(task.subtasks ?? []), { id: uid(), text, done: false }],
+      subtasks: [
+        ...(task.subtasks ?? []),
+        { id: uid(), text, done: false, minutes: parseMinutes(newSubtaskMinutes) },
+      ],
     }));
     setSubtaskInput("");
+    setNewSubtaskMinutes("0");
   };
 
   const toggleSubtask = (taskId, subtaskId) => {
@@ -366,6 +436,7 @@ function App() {
   const startEditSubtask = (sub) => {
     setEditingSubtaskId(sub.id);
     setSubtaskEditValue(sub.text);
+    setSubtaskEditMinutes(String(sub.minutes ?? 0));
   };
 
   const saveSubtaskEdit = () => {
@@ -374,15 +445,19 @@ function App() {
     if (!text) return;
     updateTask(editingTask.id, (task) => ({
       ...task,
-      subtasks: (task.subtasks ?? []).map((s) => (s.id === editingSubtaskId ? { ...s, text } : s)),
+      subtasks: (task.subtasks ?? []).map((s) =>
+        s.id === editingSubtaskId ? { ...s, text, minutes: parseMinutes(subtaskEditMinutes) } : s
+      ),
     }));
     setEditingSubtaskId(null);
     setSubtaskEditValue("");
+    setSubtaskEditMinutes("0");
   };
 
   const cancelSubtaskEdit = () => {
     setEditingSubtaskId(null);
     setSubtaskEditValue("");
+    setSubtaskEditMinutes("0");
   };
 
   const removeSubtask = (taskId, subtaskId) => {
@@ -398,9 +473,9 @@ function App() {
 
   const setDailyFocusHours = (event) => {
     event.preventDefault();
-    const value = Number(focusHoursInput);
+    const value = Number(focusMinutesInput);
     if (!Number.isFinite(value) || value <= 0) return;
-    setSettingsByDate((prev) => ({ ...prev, [selectedDate]: { focusHours: value } }));
+    setSettingsByDate((prev) => ({ ...prev, [selectedDate]: { focusMinutes: Math.floor(value) } }));
     setShowDailyModal(false);
   };
 
@@ -450,8 +525,8 @@ function App() {
           />
 
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
-            <CardLabel title="Focus 가용 시간" value={`${focusCapacity}시간`} />
-            <CardLabel title="Focus 예정 시간" value={`${focusHoursUsed}시간`} />
+            <CardLabel title="Focus 가용 시간" value={`${focusCapacityMinutes}분`} />
+            <CardLabel title="Focus 예정 시간" value={`${focusMinutesUsed}분`} />
             <CardLabel
               title="상태"
               value={isOverflow ? "초과됨 - 조정 필요" : "정상 범위"}
@@ -471,6 +546,15 @@ function App() {
                   placeholder="할 일을 입력하세요"
                   value={newTaskTitle}
                   onChange={(e) => setNewTaskTitle(e.target.value)}
+                />
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  className="w-28 shrink-0 rounded-[10px] border-2 border-[#F9A8C0] bg-[#FFF5F7] px-3 py-3 text-base font-medium text-[#F43F5E] outline-none placeholder:text-[#FBAAB8] focus:border-[#F43F5E] focus:ring-2 focus:ring-[#F43F5E]/20"
+                  placeholder="0분"
+                  value={newTaskMinutes}
+                  onChange={(e) => setNewTaskMinutes(e.target.value)}
                 />
                 <button
                   type="submit"
@@ -497,7 +581,7 @@ function App() {
 
         {isOverflow && (
           <div className="rounded-xl border-2 border-[#F9A8C0] bg-[#FFF5F7] px-4 py-3 text-sm font-medium text-[#F43F5E]">
-            Focus 열의 예상 시간({focusHoursUsed}시간)이 이 날 가용 시간({focusCapacity}시간)을 넘었습니다.
+            Focus 열의 예상 시간({focusMinutesUsed}분)이 이 날 가용 시간({focusCapacityMinutes}분)을 넘었습니다.
           </div>
         )}
 
@@ -539,7 +623,11 @@ function App() {
                           setMenuTaskId(null);
                         }
                       }}
-                      className="relative cursor-pointer rounded-xl border border-[#E8E8E8] bg-white p-3 shadow-sm transition hover:shadow-md"
+                      className={`relative cursor-pointer rounded-xl bg-white p-3 shadow-sm transition hover:shadow-md ${
+                        column.id === "focus"
+                          ? "border-2 border-[#F9A8C0]"
+                          : "border border-[#E8E8E8]"
+                      }`}
                     >
                       <div className="flex items-start gap-2">
                         <div className="min-w-0 flex-1">
@@ -552,6 +640,9 @@ function App() {
                           </p>
                           <div className="mt-2">
                             <SizeTag size={task.size} />
+                            <span className="ml-2 inline-block rounded-full bg-[#F3F4F6] px-2 py-0.5 text-xs font-semibold text-[#555]">
+                              {task.minutes ?? 0}분
+                            </span>
                           </div>
                         </div>
                         <div className="flex shrink-0 items-start gap-1" onClick={(e) => e.stopPropagation()}>
@@ -587,6 +678,36 @@ function App() {
                           </div>
                         </div>
                       </div>
+                      {column.id === "focus" && (task.subtasks?.length ?? 0) > 0 && (
+                        <div className="mt-3 space-y-2">
+                          {(task.subtasks ?? []).map((sub) => (
+                            <div
+                              key={sub.id}
+                              className="ml-3 rounded-lg border-l-4 border-[#F9A8C0] bg-[#FFF5F7] px-3 py-2"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <div className="flex items-start gap-2">
+                                <input
+                                  type="checkbox"
+                                  className="mt-0.5 h-4 w-4 shrink-0 accent-[#F43F5E]"
+                                  checked={sub.done}
+                                  onChange={() => toggleSubtask(task.id, sub.id)}
+                                />
+                                <span
+                                  className={`min-w-0 flex-1 text-sm ${
+                                    sub.done ? "text-[#aaa] line-through" : "text-[#444]"
+                                  }`}
+                                >
+                                  {sub.text}
+                                </span>
+                                <span className="shrink-0 text-xs font-semibold text-[#F43F5E]">
+                                  {sub.minutes ?? 0}분
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       <ColumnMoveButtons status={task.status} onSelect={(next) => moveTask(task.id, next)} />
                     </article>
                   );
@@ -605,16 +726,16 @@ function App() {
 
       {showDailyModal && (
         <ModalShell onClose={() => setShowDailyModal(false)}>
-          <h2 className="text-lg font-bold text-[#F43F5E]">이 날짜에 몇 시간 집중할 수 있어?</h2>
+          <h2 className="text-lg font-bold text-[#F43F5E]">오늘 몇 분 집중할 수 있어?</h2>
           <p className="mt-1 text-sm text-[#888]">선택한 날짜({selectedDate}) 기준으로 저장됩니다.</p>
           <form className="mt-4 space-y-4" onSubmit={setDailyFocusHours}>
             <input
               type="number"
-              min="0.5"
-              step="0.5"
+              min="1"
+              step="1"
               className="w-full rounded-xl border-2 border-[#F9A8C0] bg-[#FFF5F7] px-4 py-2.5 outline-none focus:border-[#F43F5E]"
-              value={focusHoursInput}
-              onChange={(e) => setFocusHoursInput(e.target.value)}
+              value={focusMinutesInput}
+              onChange={(e) => setFocusMinutesInput(e.target.value)}
             />
             <button
               type="submit"
@@ -680,6 +801,19 @@ function App() {
               </div>
             </div>
             <div>
+              <label className="mb-1 block text-xs font-medium text-[#888]">예상 소요 시간(분)</label>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                className="w-full rounded-xl border-2 border-[#F9A8C0] bg-[#FFF5F7] px-4 py-2.5 font-medium text-[#F43F5E] outline-none focus:border-[#F43F5E]"
+                value={String(editingTask.minutes ?? 0)}
+                onChange={(e) =>
+                  updateTask(editingTask.id, (t) => ({ ...t, minutes: parseMinutes(e.target.value) }))
+                }
+              />
+            </div>
+            <div>
               <p className="mb-2 text-xs font-medium text-[#888]">열</p>
               <div className="flex flex-wrap gap-2">
                 {["later", "focus", "done"].map((st) => (
@@ -721,6 +855,15 @@ function App() {
                   value={subtaskInput}
                   onChange={(e) => setSubtaskInput(e.target.value)}
                 />
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  className="w-20 shrink-0 rounded-xl border-2 border-[#F9A8C0] bg-[#FFF5F7] px-2 py-2 text-sm text-[#F43F5E] outline-none"
+                  placeholder="0분"
+                  value={newSubtaskMinutes}
+                  onChange={(e) => setNewSubtaskMinutes(e.target.value)}
+                />
                 <button
                   type="submit"
                   className="shrink-0 rounded-xl bg-[#F43F5E] px-4 py-2 text-sm font-semibold text-white hover:bg-[#e11d48]"
@@ -756,6 +899,14 @@ function App() {
                             }}
                             autoFocus
                           />
+                          <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            className="w-full rounded-lg border-2 border-[#F9A8C0] bg-[#FFF5F7] px-2 py-1.5 text-sm text-[#F43F5E] outline-none"
+                            value={subtaskEditMinutes}
+                            onChange={(e) => setSubtaskEditMinutes(e.target.value)}
+                          />
                           <div className="flex flex-wrap gap-1">
                             <button
                               type="button"
@@ -774,11 +925,18 @@ function App() {
                           </div>
                         </div>
                       ) : (
-                        <span
-                          className={`min-w-0 flex-1 text-sm ${sub.done ? "text-[#aaa] line-through" : "text-[#444]"}`}
-                        >
-                          {sub.text}
-                        </span>
+                        <div className="flex min-w-0 flex-1 items-start justify-between gap-2">
+                          <span
+                            className={`min-w-0 flex-1 text-sm ${
+                              sub.done ? "text-[#aaa] line-through" : "text-[#444]"
+                            }`}
+                          >
+                            {sub.text}
+                          </span>
+                          <span className="shrink-0 text-xs font-semibold text-[#F43F5E]">
+                            {sub.minutes ?? 0}분
+                          </span>
+                        </div>
                       )}
                     </div>
                     <div
