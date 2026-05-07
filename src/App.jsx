@@ -71,9 +71,14 @@ function ColumnMoveButtonGroup({ status, onSelect }) {
   return (
     <>
       {status === "later" && (
-        <button type="button" className={COLUMN_MOVE_PILL} onClick={() => onSelect("focus")}>
-          Focus
-        </button>
+        <>
+          <button type="button" className={COLUMN_MOVE_PILL} onClick={() => onSelect("focus")}>
+            Focus
+          </button>
+          <button type="button" className={COLUMN_MOVE_PILL} onClick={() => onSelect("done")}>
+            Done
+          </button>
+        </>
       )}
       {status === "focus" && (
         <>
@@ -86,9 +91,14 @@ function ColumnMoveButtonGroup({ status, onSelect }) {
         </>
       )}
       {status === "done" && (
-        <button type="button" className={COLUMN_MOVE_PILL} onClick={() => onSelect("focus")}>
-          Focus
-        </button>
+        <>
+          <button type="button" className={COLUMN_MOVE_PILL} onClick={() => onSelect("later")}>
+            Later
+          </button>
+          <button type="button" className={COLUMN_MOVE_PILL} onClick={() => onSelect("focus")}>
+            Focus
+          </button>
+        </>
       )}
     </>
   );
@@ -161,7 +171,7 @@ function carryForwardIncompleteTasks(tasksByDate, todayDateKey) {
   const toCopy = [];
 
   Object.entries(next).forEach(([dateKey, list]) => {
-    if (dateKey >= todayDateKey || !Array.isArray(list)) return;
+    if (dateKey === todayDateKey || !Array.isArray(list)) return;
     list.forEach((task) => {
       if (task.status === "done") return;
       if (existingIds.has(task.id)) return;
@@ -357,12 +367,13 @@ function App() {
     const initial = { later: [], focus: [], done: [] };
     tasks.forEach((task) => {
       if (!initial[task.status]) return;
+      if (task.status === "done") return;
       initial[task.status].push(task);
     });
     return {
       later: sortedByPinAndRecent(initial.later),
       focus: sortedByPinAndRecent(initial.focus),
-      done: sortedByPinAndRecent(initial.done),
+      done: [],
     };
   }, [tasks]);
 
