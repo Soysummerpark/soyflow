@@ -147,9 +147,19 @@ function normalizeSubtask(sub) {
   };
 }
 
-function normalizeTask(task) {
+function normalizeTask(task, fallbackDoneDateKey = null) {
+  const normalizedStatus = task?.status ?? "later";
+  const doneDateKey =
+    typeof task?.doneDateKey === "string" && task.doneDateKey
+      ? task.doneDateKey
+      : normalizedStatus === "done"
+        ? fallbackDoneDateKey
+        : null;
+
   return {
     ...task,
+    status: normalizedStatus,
+    doneDateKey,
     minutes: Number.isFinite(Number(task?.minutes)) ? Math.max(0, Math.floor(Number(task.minutes))) : 0,
     subtasks: Array.isArray(task?.subtasks) ? task.subtasks.map(normalizeSubtask) : [],
   };
@@ -159,7 +169,31 @@ function normalizeTasksByDate(tasksByDate) {
   const next = {};
   Object.entries(tasksByDate ?? {}).forEach(([dateKey, list]) => {
     if (!Array.isArray(list)) return;
-    next[dateKey] = list.map(normalizeTask);
+    next[dateKey] = list.map((task) => normalizeTask(task, dateKey));
+  });
+  return next;
+}
+
+function getDaysDiff(fromDateKey, toDateKey) {
+  const from = parseDateKey(fromDateKey);
+  const to = parseDateKey(toDateKey);
+  const ms = to.getTime() - from.getTime();
+  return Math.floor(ms / 86_400_000);
+}
+
+function pruneExpiredDoneTasks(tasksByDate, todayDateKey) {
+  const next = {};
+  Object.entries(tasksByDate ?? {}).forEach(([dateKey, list]) => {
+    if (!Array.isArray(list)) {
+      next[dateKey] = list;
+      return;
+    }
+    next[dateKey] = list.filter((task) => {
+      if (task?.status !== "done") return true;
+      const doneDateKey = task?.doneDateKey;
+      if (!doneDateKey) return true;
+      return getDaysDiff(doneDateKey, todayDateKey) < 3;
+    });
   });
   return next;
 }
@@ -237,7 +271,8 @@ function loadTasksByDate() {
       const parsed = JSON.parse(rawV2);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const normalized = normalizeTasksByDate(parsed);
-        return carryForwardIncompleteTasks(normalized, today);
+        const pruned = pruneExpiredDoneTasks(normalized, today);
+        return carryForwardIncompleteTasks(pruned, today);
       }
     }
     const rawV1 = localStorage.getItem(STORAGE_KEY_V1);
@@ -245,13 +280,14 @@ function loadTasksByDate() {
       const parsed = JSON.parse(rawV1);
       if (Array.isArray(parsed) && parsed.length > 0) {
         const normalized = normalizeTasksByDate({ [today]: parsed });
-        return carryForwardIncompleteTasks(normalized, today);
+        const pruned = pruneExpiredDoneTasks(normalized, today);
+        return carryForwardIncompleteTasks(pruned, today);
       }
     }
   } catch {
     /* ignore */
   }
-  return carryForwardIncompleteTasks({}, today);
+  return carryForwardIncompleteTasks(pruneExpiredDoneTasks({}, today), today);
 }
 
 function formatDateLabel(dateKey) {
@@ -292,6 +328,7 @@ function App() {
   const [menuTaskId, setMenuTaskId] = useState(null);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState(() => getLocalDateString().slice(0, 7));
+  const [doneHistoryOpen, setDoneHistoryOpen] = useState(false);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(tasksByDate));
@@ -305,7 +342,10 @@ function App() {
     const tick = () => {
       const latestToday = getLocalDateString();
       setTodayKey(latestToday);
-      setTasksByDate((prev) => carryForwardIncompleteTasks(prev, latestToday));
+      setTasksByDate((prev) => {
+        const pruned = pruneExpiredDoneTasks(prev, latestToday);
+        return carryForwardIncompleteTasks(pruned, latestToday);
+      });
     };
     tick();
     const id = setInterval(tick, 60_000);
@@ -408,7 +448,11 @@ function App() {
   };
 
   const moveTask = (taskId, nextStatus) => {
-    updateTask(taskId, (task) => ({ ...task, status: nextStatus }));
+    updateTask(taskId, (task) => ({
+      ...task,
+      status: nextStatus,
+      doneDateKey: nextStatus === "done" ? selectedDate : null,
+    }));
   };
 
   const deleteTask = (taskId) => {
@@ -494,6 +538,24 @@ function App() {
 
   const hasTasksOnDate = (dateKey) => (tasksByDate[dateKey]?.length ?? 0) > 0;
 
+  const doneHistoryByDate = useMemo(() => {
+    const groupedByDoneDate = {};
+    Object.values(tasksByDate).forEach((list) => {
+      if (!Array.isArray(list)) return;
+      list.forEach((task) => {
+        if (task.status !== "done" || !task.doneDateKey) return;
+        if (!groupedByDoneDate[task.doneDateKey]) groupedByDoneDate[task.doneDateKey] = [];
+        groupedByDoneDate[task.doneDateKey].push(task);
+      });
+    });
+
+    Object.keys(groupedByDoneDate).forEach((dateKey) => {
+      groupedByDoneDate[dateKey] = sortedByPinAndRecent(groupedByDoneDate[dateKey]);
+    });
+
+    return Object.entries(groupedByDoneDate).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  }, [tasksByDate]);
+
   const openCalendar = () => {
     setCalendarMonth(selectedDate.slice(0, 7));
     setCalendarOpen(true);
@@ -519,6 +581,13 @@ function App() {
               onClick={openDailyModal}
             >
               집중시간 설정
+            </button>
+            <button
+              type="button"
+              className="rounded-xl border-2 border-[#A5D6A7] bg-[#E8F5E9] px-4 py-2 text-sm font-semibold text-[#2E7D32] transition hover:bg-[#DCEDC8]"
+              onClick={() => setDoneHistoryOpen(true)}
+            >
+              Done 히스토리
             </button>
           </div>
 
@@ -780,6 +849,40 @@ function App() {
             }
             onSelectDate={selectCalendarDate}
           />
+        </ModalShell>
+      )}
+
+      {doneHistoryOpen && (
+        <ModalShell onClose={() => setDoneHistoryOpen(false)}>
+          <h2 className="text-lg font-bold text-[#2E7D32]">Done 히스토리</h2>
+          <p className="mt-1 text-sm text-[#888]">완료 처리된 날짜 기준으로 항목을 확인할 수 있어요.</p>
+          <div className="mt-4 max-h-[60vh] space-y-4 overflow-y-auto pr-1">
+            {doneHistoryByDate.map(([dateKey, list]) => (
+              <section key={dateKey} className="rounded-xl border border-[#E0E0E0] bg-[#FAFAFA] p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-sm font-bold text-[#2E7D32]">{formatDateLabel(dateKey)}</p>
+                  <span className="rounded-full bg-white px-2 py-0.5 text-xs font-semibold text-[#666]">
+                    {list.length}
+                  </span>
+                </div>
+                <ul className="space-y-2">
+                  {list.map((task) => (
+                    <li key={task.id} className="rounded-lg border border-[#eee] bg-white px-3 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="min-w-0 flex-1 truncate text-sm font-semibold text-[#444]">{task.title}</p>
+                        <span className="shrink-0 text-xs font-semibold text-[#666]">{task.minutes ?? 0}분</span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+            {doneHistoryByDate.length === 0 && (
+              <div className="rounded-xl border border-dashed border-[#ddd] bg-white p-4 text-center text-sm text-[#aaa]">
+                완료 히스토리가 없습니다.
+              </div>
+            )}
+          </div>
         </ModalShell>
       )}
 
