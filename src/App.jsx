@@ -198,34 +198,58 @@ function pruneExpiredDoneTasks(tasksByDate, todayDateKey) {
   return next;
 }
 
-function carryForwardIncompleteTasks(tasksByDate, todayDateKey) {
-  const next = { ...tasksByDate };
-  const todayList = next[todayDateKey] ?? [];
-  const existingIds = new Set(todayList.map((t) => t.id));
-  const toCopy = [];
-
-  Object.entries(next).forEach(([dateKey, list]) => {
-    if (dateKey === todayDateKey || !Array.isArray(list)) return;
+/** 같은 id가 여러 날짜 버킷에 있으면 가장 이른 작성일 버킷만 유지 */
+function dedupeTasksStorage(tasksByDate) {
+  const canonicalDateById = new Map();
+  Object.entries(tasksByDate ?? {}).forEach(([dateKey, list]) => {
+    if (!Array.isArray(list)) return;
     list.forEach((task) => {
-      if (task.status === "done") return;
-      if (existingIds.has(task.id)) return;
-      existingIds.add(task.id);
-      toCopy.push({
-        ...task,
-        subtasks: Array.isArray(task.subtasks)
-          ? task.subtasks.map((sub) => ({ ...sub }))
-          : [],
-      });
+      const prev = canonicalDateById.get(task.id);
+      if (!prev || dateKey < prev) canonicalDateById.set(task.id, dateKey);
     });
   });
 
-  if (toCopy.length > 0) {
-    next[todayDateKey] = [...toCopy, ...todayList];
-  } else if (!next[todayDateKey]) {
-    next[todayDateKey] = todayList;
-  }
-
+  const next = {};
+  Object.entries(tasksByDate ?? {}).forEach(([dateKey, list]) => {
+    if (!Array.isArray(list)) {
+      next[dateKey] = list;
+      return;
+    }
+    next[dateKey] = list.filter((task) => canonicalDateById.get(task.id) === dateKey);
+  });
   return next;
+}
+
+function withTaskStatus(task, nextStatus, selectedDateKey) {
+  return {
+    ...task,
+    status: nextStatus,
+    doneDateKey: nextStatus === "done" ? selectedDateKey : null,
+  };
+}
+
+/** 선택한 날짜 뷰에 표시할 태스크: later/focus는 작성일~이후, done은 완료일만, 미래 작성분은 해당일부터 */
+function getTasksForView(tasksByDate, selectedDateKey) {
+  const byId = new Map();
+
+  Object.entries(tasksByDate ?? {}).forEach(([scheduledDateKey, list]) => {
+    if (!Array.isArray(list)) return;
+    list.forEach((task) => {
+      const shouldShow =
+        task.status === "done"
+          ? task.doneDateKey === selectedDateKey
+          : scheduledDateKey <= selectedDateKey;
+
+      if (!shouldShow) return;
+
+      const existing = byId.get(task.id);
+      if (!existing || scheduledDateKey < existing.scheduledDateKey) {
+        byId.set(task.id, { task, scheduledDateKey });
+      }
+    });
+  });
+
+  return Array.from(byId.values()).map((entry) => entry.task);
 }
 
 function loadSettingsByDate() {
@@ -272,7 +296,7 @@ function loadTasksByDate() {
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const normalized = normalizeTasksByDate(parsed);
         const pruned = pruneExpiredDoneTasks(normalized, today);
-        return carryForwardIncompleteTasks(pruned, today);
+        return dedupeTasksStorage(pruned);
       }
     }
     const rawV1 = localStorage.getItem(STORAGE_KEY_V1);
@@ -281,13 +305,13 @@ function loadTasksByDate() {
       if (Array.isArray(parsed) && parsed.length > 0) {
         const normalized = normalizeTasksByDate({ [today]: parsed });
         const pruned = pruneExpiredDoneTasks(normalized, today);
-        return carryForwardIncompleteTasks(pruned, today);
+        return dedupeTasksStorage(pruned);
       }
     }
   } catch {
     /* ignore */
   }
-  return carryForwardIncompleteTasks(pruneExpiredDoneTasks({}, today), today);
+  return dedupeTasksStorage(pruneExpiredDoneTasks({}, today));
 }
 
 function formatDateLabel(dateKey) {
@@ -342,10 +366,7 @@ function App() {
     const tick = () => {
       const latestToday = getLocalDateString();
       setTodayKey(latestToday);
-      setTasksByDate((prev) => {
-        const pruned = pruneExpiredDoneTasks(prev, latestToday);
-        return carryForwardIncompleteTasks(pruned, latestToday);
-      });
+      setTasksByDate((prev) => dedupeTasksStorage(pruneExpiredDoneTasks(prev, latestToday)));
     };
     tick();
     const id = setInterval(tick, 60_000);
@@ -366,7 +387,10 @@ function App() {
     setNewSubtaskMinutes("0");
   }, [editingTaskId]);
 
-  const tasks = tasksByDate[selectedDate] ?? [];
+  const tasks = useMemo(
+    () => getTasksForView(tasksByDate, selectedDate),
+    [tasksByDate, selectedDate]
+  );
 
   const setTaskList = (updater) => {
     setTasksByDate((prev) => {
@@ -444,19 +468,35 @@ function App() {
   };
 
   const updateTask = (taskId, updater) => {
-    setTaskList((prev) => prev.map((task) => (task.id === taskId ? updater(task) : task)));
+    setTasksByDate((prev) => {
+      const next = {};
+      Object.entries(prev).forEach(([dateKey, list]) => {
+        if (!Array.isArray(list)) {
+          next[dateKey] = list;
+          return;
+        }
+        next[dateKey] = list.map((task) => (task.id === taskId ? updater(task) : task));
+      });
+      return next;
+    });
   };
 
   const moveTask = (taskId, nextStatus) => {
-    updateTask(taskId, (task) => ({
-      ...task,
-      status: nextStatus,
-      doneDateKey: nextStatus === "done" ? selectedDate : null,
-    }));
+    updateTask(taskId, (task) => withTaskStatus(task, nextStatus, selectedDate));
   };
 
   const deleteTask = (taskId) => {
-    setTaskList((prev) => prev.filter((t) => t.id !== taskId));
+    setTasksByDate((prev) => {
+      const next = {};
+      Object.entries(prev).forEach(([dateKey, list]) => {
+        if (!Array.isArray(list)) {
+          next[dateKey] = list;
+          return;
+        }
+        next[dateKey] = list.filter((task) => task.id !== taskId);
+      });
+      return next;
+    });
     if (editingTaskId === taskId) setEditingTaskId(null);
     setMenuTaskId(null);
   };
@@ -536,7 +576,7 @@ function App() {
   const goPrevDay = () => setSelectedDate((d) => addDaysToDateKey(d, -1));
   const goNextDay = () => setSelectedDate((d) => addDaysToDateKey(d, 1));
 
-  const hasTasksOnDate = (dateKey) => (tasksByDate[dateKey]?.length ?? 0) > 0;
+  const hasTasksOnDate = (dateKey) => getTasksForView(tasksByDate, dateKey).length > 0;
 
   const doneHistoryByDate = useMemo(() => {
     const groupedByDoneDate = {};
@@ -938,7 +978,7 @@ function App() {
                         ? "border-[#F43F5E] bg-[#FFF5F7] text-[#F43F5E]"
                         : "border-[#eee] bg-[#f9f9f9] text-[#aaa]"
                     }`}
-                    onClick={() => updateTask(editingTask.id, (t) => ({ ...t, status: st }))}
+                    onClick={() => updateTask(editingTask.id, (t) => withTaskStatus(t, st, selectedDate))}
                   >
                     {st === "later" ? "Later" : st === "focus" ? "Focus" : "Done"}
                   </button>
@@ -1059,7 +1099,7 @@ function App() {
                       <ColumnMoveButtonGroup
                         status={editingTask.status}
                         onSelect={(next) =>
-                          updateTask(editingTask.id, (t) => ({ ...t, status: next }))
+                          updateTask(editingTask.id, (t) => withTaskStatus(t, next, selectedDate))
                         }
                       />
                       {editingSubtaskId !== sub.id && (
